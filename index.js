@@ -1,12 +1,28 @@
 import { ImapFlow } from "imapflow";
 
-const client = new ImapFlow({
-  host: process.env.IMAP_HOST,
-  port: Number(process.env.IMAP_PORT || 993),
+/**
+ * ⚠️ TEMP CONFIG FOR TESTING
+ * Replace these values locally.
+ * Do NOT commit real credentials.
+ */
+const IMAP_CONFIG = {
+  host: "imap.hostinger.com",   // or "imap.titan.email"
+  port: 993,
   secure: true,
+  user: "daniel.clark@theciovision.com",
+  pass: "Prajwal@78910"
+};
+
+console.log("IMAP HOST:", IMAP_CONFIG.host);
+console.log("IMAP PORT:", IMAP_CONFIG.port);
+
+const client = new ImapFlow({
+  host: IMAP_CONFIG.host,
+  port: IMAP_CONFIG.port,
+  secure: IMAP_CONFIG.secure,
   auth: {
-    user: process.env.IMAP_USER,
-    pass: process.env.IMAP_PASS
+    user: IMAP_CONFIG.user,
+    pass: IMAP_CONFIG.pass
   }
 });
 
