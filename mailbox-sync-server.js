@@ -31,6 +31,11 @@ const DEFAULT_REPLY_REFERENCES_LIMIT = '20';
 const DEFAULT_REPLY_REFERENCES_CHAR_LIMIT = '1900';
 const DEFAULT_CHECK_LOOKBACK_DAYS = '7';
 const DEFAULT_MAILBOX_ADMIN_SECRET = '';
+const DEFAULT_AUTO_CHECK_REPLIES = 'false';
+const DEFAULT_AUTO_CHECK_INTERVAL_MINUTES = '10';
+const DEFAULT_AUTO_CHECK_LOOKBACK_DAYS = DEFAULT_CHECK_LOOKBACK_DAYS;
+const DEFAULT_AUTO_CHECK_USE_DB_SCAN = 'false';
+const DEFAULT_AUTO_CHECK_CONFIG_ID = '';
 
 const PORT = Number(process.env.PORT || process.env.MAILBOX_SERVER_PORT || DEFAULT_MAILBOX_PORT);
 const ALLOWED_ORIGINS = (process.env.MAILBOX_ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS)
@@ -209,19 +214,10 @@ const syncMailbox = async (config, limit = 50, dbClient) => {
     throw new Error('Supabase client not configured');
   }
   const client = buildImapClient(config);
-  // prevent unhandled 'error' events from crashing the process
-  client.on?.('error', (err) => {
-    console.error('[mailbox] IMAP client error:', err);
-  });
   let processed = 0;
   const rows = [];
-  try {
-    await client.connect();
-  } catch (err) {
-    console.error('[mailbox] IMAP connect failed for', config.imap_host, err?.message || err);
-    // rethrow so caller returns a 500 and can report the failure
-    throw err;
-  }
+
+  await client.connect();
 
   try {
     const mailbox = await client.mailboxOpen('INBOX');
@@ -376,6 +372,19 @@ const parseHostCandidates = (value) => {
   }
   return undefined;
 };
+
+const AUTO_CHECK_REPLIES = parseBoolean(process.env.MAILBOX_AUTO_CHECK_REPLIES || DEFAULT_AUTO_CHECK_REPLIES);
+const AUTO_CHECK_INTERVAL_MINUTES = (() => {
+  const parsed = Number(process.env.MAILBOX_AUTO_CHECK_INTERVAL_MINUTES || DEFAULT_AUTO_CHECK_INTERVAL_MINUTES);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : Number(DEFAULT_AUTO_CHECK_INTERVAL_MINUTES);
+})();
+const AUTO_CHECK_LOOKBACK_DAYS = (() => {
+  const parsed = Number(process.env.MAILBOX_AUTO_CHECK_LOOKBACK_DAYS || DEFAULT_AUTO_CHECK_LOOKBACK_DAYS);
+  const safe = Number.isFinite(parsed) ? parsed : Number(DEFAULT_AUTO_CHECK_LOOKBACK_DAYS);
+  return Math.max(1, Math.min(60, safe));
+})();
+const AUTO_CHECK_USE_DB_SCAN = parseBoolean(process.env.MAILBOX_AUTO_CHECK_USE_DB_SCAN || DEFAULT_AUTO_CHECK_USE_DB_SCAN);
+const AUTO_CHECK_CONFIG_ID = (process.env.MAILBOX_AUTO_CHECK_CONFIG_ID || DEFAULT_AUTO_CHECK_CONFIG_ID || '').trim();
 
 const buildCheckOverrides = (body) => {
   const nested = body?.overrides && typeof body.overrides === 'object' ? body.overrides : {};
@@ -1161,6 +1170,114 @@ const loadConfigForUser = async (dbClient, user, configId, canBypassAuth) => {
   return data;
 };
 
+const runReplyCheck = async ({ configId, lookbackDays, useDbScan, overrides, source = 'manual' } = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error('Supabase service role key is required for reply checks.');
+  }
+
+  const safeConfigId = configId ? String(configId).trim() : '';
+  const parsedLookback = Number(lookbackDays ?? DEFAULT_CHECK_LOOKBACK_DAYS);
+  const fallbackLookback = Number(DEFAULT_CHECK_LOOKBACK_DAYS);
+  const safeLookbackDays = Math.max(
+    1,
+    Math.min(60, Number.isFinite(parsedLookback) ? parsedLookback : fallbackLookback)
+  );
+  const safeUseDbScan = parseBoolean(useDbScan);
+  const safeOverrides = overrides && typeof overrides === 'object' ? overrides : buildCheckOverrides({});
+
+  let query = supabaseAdmin.from('email_configs').select('*');
+  if (!safeUseDbScan) {
+    query = query.not('imap_host', 'is', null);
+  }
+  if (safeConfigId) {
+    query = query.eq('id', safeConfigId);
+  }
+
+  const { data: configs, error } = await query;
+  if (error) {
+    console.error('[mailbox] Failed to load email configs for reply check:', error);
+    throw new Error('Failed to load email configurations.');
+  }
+
+  const results = [];
+  const safeConfigs = configs ?? [];
+
+  for (const config of safeConfigs) {
+    try {
+      const result = safeUseDbScan
+        ? await processDbEmails(supabaseAdmin, config, safeLookbackDays)
+        : await checkRepliesAndBouncesForConfig(supabaseAdmin, config, safeLookbackDays, safeOverrides);
+      results.push({ email: config.smtp_username, result });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    } catch (err) {
+      console.error(`[mailbox] Error processing ${config.smtp_username}:`, err);
+      results.push({ email: config.smtp_username, error: err?.message || 'Reply check failed' });
+    }
+  }
+
+  return {
+    success: true,
+    results,
+    lookbackDays: safeLookbackDays,
+    configCount: safeConfigs.length,
+    useDbScan: safeUseDbScan,
+    source,
+  };
+};
+
+let autoCheckInFlight = false;
+let autoCheckTimer = null;
+
+const startAutoReplyChecks = () => {
+  if (!AUTO_CHECK_REPLIES) return;
+  if (!supabaseAdmin) {
+    console.warn('[mailbox] Auto reply checks disabled: SUPABASE_SERVICE_ROLE_KEY is required.');
+    return;
+  }
+
+  const intervalMs = Math.max(1, AUTO_CHECK_INTERVAL_MINUTES) * 60 * 1000;
+  const overrides = buildCheckOverrides({});
+
+  const run = async () => {
+    if (autoCheckInFlight) {
+      console.log('[mailbox] Auto reply check skipped (previous run still in progress).');
+      return;
+    }
+    autoCheckInFlight = true;
+    const startedAt = Date.now();
+    try {
+      const payload = await runReplyCheck({
+        configId: AUTO_CHECK_CONFIG_ID || undefined,
+        lookbackDays: AUTO_CHECK_LOOKBACK_DAYS,
+        useDbScan: AUTO_CHECK_USE_DB_SCAN,
+        overrides,
+        source: 'auto',
+      });
+      const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
+      console.log(
+        `[mailbox] Auto reply check complete in ${durationSeconds}s (${payload.configCount} mailbox${
+          payload.configCount === 1 ? '' : 'es'
+        }).`
+      );
+    } catch (error) {
+      console.error('[mailbox] Auto reply check failed:', error?.message || error);
+    } finally {
+      autoCheckInFlight = false;
+    }
+  };
+
+  console.log(
+    `[mailbox] Auto reply checks enabled. Interval: ${AUTO_CHECK_INTERVAL_MINUTES} min, lookback: ${AUTO_CHECK_LOOKBACK_DAYS} days${
+      AUTO_CHECK_CONFIG_ID ? `, configId: ${AUTO_CHECK_CONFIG_ID}` : ''
+    }.`
+  );
+  run();
+  autoCheckTimer = setInterval(run, intervalMs);
+  if (typeof autoCheckTimer?.unref === 'function') {
+    autoCheckTimer.unref();
+  }
+};
+
 app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -1587,51 +1704,21 @@ app.post('/check-email-replies', async (req, res) => {
     if (!matchesAdminSecret(req)) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
-
-    if (!supabaseAdmin) {
-      return res.status(500).json({
-        error: 'Supabase service role key is required for reply checks.',
-      });
-    }
-
     const body = req.body || {};
     const configId = body.config_id || body.configId || body.mailboxId || null;
     const lookbackValue = body.lookback_days ?? body.lookbackDays ?? DEFAULT_CHECK_LOOKBACK_DAYS;
-    const lookbackDays = Math.max(1, Math.min(60, Number(lookbackValue) || Number(DEFAULT_CHECK_LOOKBACK_DAYS)));
     const useDbScan = parseBoolean(body.use_db_scan ?? body.useDbScan);
     const overrides = buildCheckOverrides(body);
 
-    let query = supabaseAdmin.from('email_configs').select('*');
-    if (!useDbScan) {
-      query = query.not('imap_host', 'is', null);
-    }
-    if (configId) {
-      query = query.eq('id', configId);
-    }
+    const payload = await runReplyCheck({
+      configId,
+      lookbackDays: lookbackValue,
+      useDbScan,
+      overrides,
+      source: 'manual',
+    });
 
-    const { data: configs, error } = await query;
-    if (error) {
-      console.error('[mailbox] Failed to load email configs for reply check:', error);
-      return res.status(500).json({ error: 'Failed to load email configurations.' });
-    }
-
-    const results = [];
-    const safeConfigs = configs ?? [];
-
-    for (const config of safeConfigs) {
-      try {
-        const result = useDbScan
-          ? await processDbEmails(supabaseAdmin, config, lookbackDays)
-          : await checkRepliesAndBouncesForConfig(supabaseAdmin, config, lookbackDays, overrides);
-        results.push({ email: config.smtp_username, result });
-        await new Promise((resolve) => setTimeout(resolve, 1000));
-      } catch (err) {
-        console.error(`[mailbox] Error processing ${config.smtp_username}:`, err);
-        results.push({ email: config.smtp_username, error: err?.message || 'Reply check failed' });
-      }
-    }
-
-    return res.json({ success: true, results });
+    return res.json(payload);
   } catch (error) {
     console.error('[mailbox] Reply check error:', error);
     return res.status(500).json({ error: error?.message || 'Reply check failed' });
@@ -1640,5 +1727,5 @@ app.post('/check-email-replies', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Mailbox sync server listening on port ${PORT}`);
   console.log('Allowed origins:', ALLOWED_ORIGINS.join(', ') || '*');
+  startAutoReplyChecks();
 });
-
