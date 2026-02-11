@@ -5,11 +5,21 @@
   "license": "ISC",
   "author": "",
   "type": "module",
-  "main": "index.js",
+  "main": "mailbox-sync-server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon --watch . --ext js,json --exec node mailbox-sync-server.js"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   },
   "dependencies": {
-    "imapflow": "^1.2.9"
+    "@supabase/supabase-js": "^2.95.3",
+    "axios": "^1.13.5",
+    "cors": "^2.8.6",
+    "dotenv": "^17.2.4",
+    "express": "^5.2.1",
+    "imapflow": "^1.2.9",
+    "mailparser": "^3.9.3"
   }
 }
