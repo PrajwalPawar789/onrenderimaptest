@@ -7,6 +7,7 @@
   "type": "module",
   "main": "mailbox-sync-server.js",
   "scripts": {
+    "start": "node mailbox-sync-server.js",
     "test": "echo \"Error: no test specified\" && exit 1",
     "dev": "nodemon --watch . --ext js,json --exec node mailbox-sync-server.js"
   },
