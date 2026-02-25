@@ -15,10 +15,9 @@ import EmailService, {
   normalizeReferences,
 } from './services/email-service.js';
 
-const DEFAULT_SUPABASE_URL = 'https://lyerkyijpavilyufcrgb.supabase.co';
-const DEFAULT_SUPABASE_ANON_KEY =
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imx5ZXJreWlqcGF2aWx5dWZjcmdiIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NDg3NTM0NjQsImV4cCI6MjA2NDMyOTQ2NH0.hdh-tzbNBmCusr_ZJBU_K27P-6K9s1kwpBE3PrzXiwc';
-const DEFAULT_SERVICE_ROLE_KEY = 'REDACTED_SUPABASE_SERVICE_ROLE_KEY';
+const DEFAULT_SUPABASE_URL = '';
+const DEFAULT_SUPABASE_ANON_KEY = '';
+const DEFAULT_SERVICE_ROLE_KEY = '';
 const DEFAULT_ALLOWED_ORIGINS = 'http://localhost:5173,http://localhost:8080,http://10.127.57.196:8080';
 const DEFAULT_MAILBOX_PORT = 8787;
 const DEFAULT_BYPASS_AUTH = 'true';
@@ -36,14 +35,24 @@ const DEFAULT_AUTO_CHECK_INTERVAL_MINUTES = '10';
 const DEFAULT_AUTO_CHECK_LOOKBACK_DAYS = DEFAULT_CHECK_LOOKBACK_DAYS;
 const DEFAULT_AUTO_CHECK_USE_DB_SCAN = 'false';
 const DEFAULT_AUTO_CHECK_CONFIG_ID = '';
+const DEFAULT_AUTO_SYNC_MAILBOXES = 'false';
+const DEFAULT_AUTO_SYNC_INTERVAL_MINUTES = '10';
+const DEFAULT_AUTO_SYNC_LIMIT = '50';
+const DEFAULT_AUTO_SYNC_CONFIG_ID = '';
+const DEFAULT_MAILBOX_OAUTH_SIMULATE = 'false';
+const DEFAULT_MAILBOX_OAUTH_REDIRECT_URI = 'http://localhost:8080/dashboard?tab=settings';
+const DEFAULT_GOOGLE_OAUTH_SCOPES = 'openid email profile https://mail.google.com/';
+const DEFAULT_MICROSOFT_OAUTH_SCOPES =
+  'openid profile email offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send https://graph.microsoft.com/User.Read';
 
 const PORT = Number(process.env.PORT || process.env.MAILBOX_SERVER_PORT || DEFAULT_MAILBOX_PORT);
+const normalizeOrigin = (origin) => String(origin || '').trim().replace(/\/+$/, '');
 const ALLOWED_ORIGINS = (process.env.MAILBOX_ALLOWED_ORIGINS || DEFAULT_ALLOWED_ORIGINS)
   .split(',')
-  .map((origin) => origin.trim())
+  .map((origin) => normalizeOrigin(origin))
   .filter(Boolean);
 
-const SUPABASE_URL = process.env.SUPABASE_URL || DEFAULT_SUPABASE_URL;
+const SUPABASE_URL = process.env.SUPABASE_URL || process.env.VITE_SUPABASE_URL || DEFAULT_SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || DEFAULT_SERVICE_ROLE_KEY;
 const SUPABASE_ANON_KEY =
   process.env.SUPABASE_ANON_KEY ||
@@ -65,6 +74,20 @@ const HUBSPOT_SCOPES =
 const SALESFORCE_SCOPES =
   process.env.SALESFORCE_SCOPES ||
   'api refresh_token offline_access';
+const MAILBOX_OAUTH_SIMULATE =
+  (process.env.MAILBOX_OAUTH_SIMULATE || DEFAULT_MAILBOX_OAUTH_SIMULATE).toLowerCase() === 'true';
+const MAILBOX_OAUTH_REDIRECT_URI =
+  process.env.MAILBOX_OAUTH_REDIRECT_URI ||
+  process.env.GOOGLE_OAUTH_REDIRECT_URI ||
+  process.env.MICROSOFT_OAUTH_REDIRECT_URI ||
+  DEFAULT_MAILBOX_OAUTH_REDIRECT_URI;
+const GOOGLE_OAUTH_CLIENT_ID = process.env.GOOGLE_OAUTH_CLIENT_ID || '';
+const GOOGLE_OAUTH_CLIENT_SECRET = process.env.GOOGLE_OAUTH_CLIENT_SECRET || '';
+const GOOGLE_OAUTH_SCOPES = process.env.GOOGLE_OAUTH_SCOPES || DEFAULT_GOOGLE_OAUTH_SCOPES;
+const MICROSOFT_OAUTH_CLIENT_ID = process.env.MICROSOFT_OAUTH_CLIENT_ID || '';
+const MICROSOFT_OAUTH_CLIENT_SECRET = process.env.MICROSOFT_OAUTH_CLIENT_SECRET || '';
+const MICROSOFT_OAUTH_TENANT_ID = process.env.MICROSOFT_OAUTH_TENANT_ID || 'common';
+const MICROSOFT_OAUTH_SCOPES = process.env.MICROSOFT_OAUTH_SCOPES || DEFAULT_MICROSOFT_OAUTH_SCOPES;
 const REPLY_INCLUDE_ORIGINAL_ATTACHMENTS =
   (process.env.MAILBOX_REPLY_INCLUDE_ORIGINAL_ATTACHMENTS || DEFAULT_REPLY_INCLUDE_ORIGINAL_ATTACHMENTS).toLowerCase() ===
   'true';
@@ -92,10 +115,14 @@ const isPlaceholderValue = (value) => {
   );
 };
 
-const hasServiceRoleKey = !isPlaceholderValue(SUPABASE_SERVICE_ROLE_KEY);
-const hasAnonKey = !isPlaceholderValue(SUPABASE_ANON_KEY);
+const hasSupabaseUrl = typeof SUPABASE_URL === 'string' && SUPABASE_URL.startsWith('http');
+const hasServiceRoleKey = hasSupabaseUrl && !isPlaceholderValue(SUPABASE_SERVICE_ROLE_KEY);
+const hasAnonKey = hasSupabaseUrl && !isPlaceholderValue(SUPABASE_ANON_KEY);
 const supabaseAdmin = hasServiceRoleKey ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY) : null;
 
+if (!hasSupabaseUrl) {
+  console.warn('[mailbox] SUPABASE_URL is missing. Set it in .env.');
+}
 if (!hasServiceRoleKey) {
   console.warn('[mailbox] SUPABASE_SERVICE_ROLE_KEY is missing or placeholder. Falling back to anon key.');
 }
@@ -111,7 +138,8 @@ app.use(express.json({ limit: '10mb' }));
 app.use(
   cors({
     origin(origin, callback) {
-      if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+      const normalizedOrigin = normalizeOrigin(origin);
+      if (!origin || ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(normalizedOrigin)) {
         callback(null, true);
       } else {
         callback(new Error('Not allowed by CORS'));
@@ -129,7 +157,239 @@ const emailService = new EmailService({
   includeOriginalAttachments: REPLY_INCLUDE_ORIGINAL_ATTACHMENTS,
 });
 
-const buildImapClient = (config) => {
+const parsedOutboundEmailCreditCost = Number.parseInt(process.env.OUTBOUND_EMAIL_CREDIT_COST || '1', 10);
+const OUTBOUND_EMAIL_CREDIT_COST = Number.isFinite(parsedOutboundEmailCreditCost) && parsedOutboundEmailCreditCost > 0
+  ? parsedOutboundEmailCreditCost
+  : 1;
+
+const consumeUserCredits = async (dbClient, userId, amount, eventType, referenceId, metadata = {}) => {
+  const { data, error } = await dbClient.rpc('consume_user_credits', {
+    p_amount: amount,
+    p_event_type: eventType,
+    p_reference_id: referenceId,
+    p_metadata: metadata,
+    p_user_id: userId,
+  });
+
+  if (error) {
+    throw new Error(error?.message || 'Failed to consume credits');
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  return {
+    allowed: Boolean(row?.allowed),
+    creditsRemaining: Number(row?.credits_remaining ?? 0),
+    message: String(row?.message || ''),
+  };
+};
+
+const refundUserCredits = async (dbClient, userId, amount, eventType, referenceId, metadata = {}) => {
+  const { data, error } = await dbClient.rpc('refund_user_credits', {
+    p_amount: amount,
+    p_event_type: eventType,
+    p_reference_id: referenceId,
+    p_metadata: metadata,
+    p_user_id: userId,
+  });
+
+  if (error) {
+    console.error('[billing] Credit refund failed:', error?.message || error);
+    return null;
+  }
+
+  const row = Array.isArray(data) ? data[0] : data;
+  return Number(row?.credits_remaining ?? NaN);
+};
+
+const MAILBOX_OAUTH_REFRESH_SKEW_MS = 2 * 60 * 1000;
+
+const resolveMailboxOAuthProvider = (value) => {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return null;
+  if (normalized === 'gmail' || normalized === 'google') return 'gmail';
+  if (['outlook', 'microsoft', 'office365', 'microsoft365'].includes(normalized)) return 'outlook';
+  return null;
+};
+
+const isOAuthMailboxConfig = (config) => {
+  const authType = String(config?.auth_type || '').trim().toLowerCase();
+  const provider = resolveMailboxOAuthProvider(config?.oauth_provider);
+  return authType === 'oauth' || Boolean(provider);
+};
+
+const hasMailboxTransportCredentials = (config) => {
+  if (!config?.smtp_host || !config?.smtp_username) return false;
+  if (!isOAuthMailboxConfig(config)) {
+    return Boolean(String(config?.smtp_password || '').trim());
+  }
+  return Boolean(String(config?.oauth_access_token || '').trim() || String(config?.oauth_refresh_token || '').trim());
+};
+
+const resolveMailboxOAuthRedirectUri = (value) => {
+  const candidate = String(value || '').trim();
+  return candidate || MAILBOX_OAUTH_REDIRECT_URI;
+};
+
+const resolveMailboxPresetForProvider = (provider) => {
+  if (provider === 'gmail') {
+    return {
+      smtpHost: 'smtp.gmail.com',
+      smtpPort: 465,
+      imapHost: 'imap.gmail.com',
+      imapPort: 993,
+      security: 'SSL',
+    };
+  }
+
+  if (provider === 'outlook') {
+    return {
+      smtpHost: 'smtp.office365.com',
+      smtpPort: 587,
+      imapHost: 'outlook.office365.com',
+      imapPort: 993,
+      security: 'TLS',
+    };
+  }
+
+  return null;
+};
+
+const buildImapAuthFromConfig = (config, loginMethod) => {
+  if (!isOAuthMailboxConfig(config)) {
+    const auth = {
+      user: config.smtp_username,
+      pass: config.smtp_password,
+    };
+    if (loginMethod) {
+      auth.loginMethod = loginMethod;
+    }
+    return auth;
+  }
+
+  const accessToken = String(config?.oauth_access_token || '').trim();
+  if (!accessToken) {
+    throw new Error('OAuth access token is missing for this mailbox.');
+  }
+
+  return {
+    user: config.smtp_username,
+    accessToken,
+  };
+};
+
+const needsMailboxOAuthRefresh = (config) => {
+  if (!isOAuthMailboxConfig(config)) return false;
+
+  const refreshToken = String(config?.oauth_refresh_token || '').trim();
+  const accessToken = String(config?.oauth_access_token || '').trim();
+  if (!accessToken && refreshToken) return true;
+  if (!refreshToken) return false;
+
+  const expiresAtRaw = String(config?.oauth_token_expires_at || '').trim();
+  if (!expiresAtRaw) return false;
+
+  const expiresAtMs = Date.parse(expiresAtRaw);
+  if (!Number.isFinite(expiresAtMs)) return false;
+  return expiresAtMs - MAILBOX_OAUTH_REFRESH_SKEW_MS <= Date.now();
+};
+
+const refreshMailboxOAuthToken = async (config, dbClient) => {
+  const provider = resolveMailboxOAuthProvider(config?.oauth_provider);
+  if (!provider) {
+    throw new Error('Unsupported mailbox OAuth provider.');
+  }
+
+  const refreshToken = String(config?.oauth_refresh_token || '').trim();
+  if (!refreshToken) {
+    throw new Error('Refresh token is missing for this mailbox.');
+  }
+
+  let response;
+
+  if (provider === 'gmail') {
+    if (!GOOGLE_OAUTH_CLIENT_ID || !GOOGLE_OAUTH_CLIENT_SECRET) {
+      throw new Error('Google OAuth credentials are not configured.');
+    }
+    const payload = new URLSearchParams({
+      client_id: GOOGLE_OAUTH_CLIENT_ID,
+      client_secret: GOOGLE_OAUTH_CLIENT_SECRET,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+    });
+    response = await axios.post('https://oauth2.googleapis.com/token', payload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+  } else if (provider === 'outlook') {
+    if (!MICROSOFT_OAUTH_CLIENT_ID || !MICROSOFT_OAUTH_CLIENT_SECRET) {
+      throw new Error('Microsoft OAuth credentials are not configured.');
+    }
+    const payload = new URLSearchParams({
+      client_id: MICROSOFT_OAUTH_CLIENT_ID,
+      client_secret: MICROSOFT_OAUTH_CLIENT_SECRET,
+      grant_type: 'refresh_token',
+      refresh_token: refreshToken,
+      scope: MICROSOFT_OAUTH_SCOPES,
+    });
+    response = await axios.post(
+      `https://login.microsoftonline.com/${encodeURIComponent(MICROSOFT_OAUTH_TENANT_ID)}/oauth2/v2.0/token`,
+      payload.toString(),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }
+    );
+  } else {
+    throw new Error('Unsupported mailbox OAuth provider.');
+  }
+
+  const payload = response?.data || {};
+  const accessToken = String(payload.access_token || '').trim();
+  if (!accessToken) {
+    throw new Error('OAuth token refresh did not return an access token.');
+  }
+
+  const expiresIn = Number(payload.expires_in);
+  const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+    ? new Date(Date.now() + expiresIn * 1000).toISOString()
+    : null;
+
+  const updates = {
+    oauth_access_token: accessToken,
+    oauth_refresh_token: String(payload.refresh_token || refreshToken || '').trim() || null,
+    oauth_token_expires_at: expiresAt,
+    oauth_scope: payload.scope ? String(payload.scope) : config.oauth_scope || null,
+    oauth_token_type: payload.token_type ? String(payload.token_type) : config.oauth_token_type || 'Bearer',
+  };
+
+  if (dbClient && config?.id) {
+    const { data, error } = await dbClient
+      .from('email_configs')
+      .update(updates)
+      .eq('id', config.id)
+      .select('*')
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return data;
+  }
+
+  return {
+    ...config,
+    ...updates,
+  };
+};
+
+const ensureMailboxTransportConfig = async (config, dbClient, context = '') => {
+  if (!isOAuthMailboxConfig(config)) return config;
+  if (!needsMailboxOAuthRefresh(config)) return config;
+  try {
+    return await refreshMailboxOAuthToken(config, dbClient);
+  } catch (error) {
+    const details = error?.response?.data || error?.message || error;
+    const contextLabel = context ? ` for ${context}` : '';
+    throw new Error(`OAuth token refresh failed${contextLabel}: ${typeof details === 'string' ? details : JSON.stringify(details)}`);
+  }
+};
+
+const buildImapClient = (config, loginMethod) => {
   const security = (config.security || 'SSL').toUpperCase();
   const secure = security !== 'NONE';
   const port = config.imap_port || (secure ? 993 : 143);
@@ -138,10 +398,7 @@ const buildImapClient = (config) => {
     host: config.imap_host,
     port,
     secure,
-    auth: {
-      user: config.smtp_username,
-      pass: config.smtp_password,
-    },
+    auth: buildImapAuthFromConfig(config, loginMethod),
     tls: {
       rejectUnauthorized: false,
     },
@@ -213,7 +470,17 @@ const syncMailbox = async (config, limit = 50, dbClient) => {
   if (!dbClient) {
     throw new Error('Supabase client not configured');
   }
-  const client = buildImapClient(config);
+  const activeConfig = await ensureMailboxTransportConfig(
+    config,
+    dbClient,
+    `mailbox sync (${config?.smtp_username || config?.id || 'unknown'})`
+  );
+
+  if (!hasMailboxTransportCredentials(activeConfig)) {
+    throw new Error('Mailbox credentials are missing for this inbox.');
+  }
+
+  const client = buildImapClient(activeConfig);
   let processed = 0;
   const rows = [];
 
@@ -264,10 +531,10 @@ const syncMailbox = async (config, limit = 50, dbClient) => {
           };
         }
 
-        const row = mapMessageToRow(config, message, parsed, mailbox.path);
+        const row = mapMessageToRow(activeConfig, message, parsed, mailbox.path);
         rows.push(row);
 
-        if (processed <= 3) {
+        if (LOG_SYNC_SAMPLES && processed <= 3) {
           console.log('[mailbox] Sample row prepared:', {
             uid: row.uid,
             from: row.from_email,
@@ -300,7 +567,7 @@ const syncMailbox = async (config, limit = 50, dbClient) => {
       const { data: existingData, error: existingError } = await dbClient
         .from('email_messages')
         .select('uid')
-        .eq('config_id', config.id)
+        .eq('config_id', activeConfig.id)
         .in('uid', uniqueRows.map((row) => row.uid));
 
       if (existingError) {
@@ -385,6 +652,18 @@ const AUTO_CHECK_LOOKBACK_DAYS = (() => {
 })();
 const AUTO_CHECK_USE_DB_SCAN = parseBoolean(process.env.MAILBOX_AUTO_CHECK_USE_DB_SCAN || DEFAULT_AUTO_CHECK_USE_DB_SCAN);
 const AUTO_CHECK_CONFIG_ID = (process.env.MAILBOX_AUTO_CHECK_CONFIG_ID || DEFAULT_AUTO_CHECK_CONFIG_ID || '').trim();
+const LOG_SYNC_SAMPLES = parseBoolean(process.env.MAILBOX_LOG_SYNC_SAMPLES || 'false');
+const AUTO_SYNC_MAILBOXES = parseBoolean(process.env.MAILBOX_AUTO_SYNC_MAILBOXES || DEFAULT_AUTO_SYNC_MAILBOXES);
+const AUTO_SYNC_INTERVAL_MINUTES = (() => {
+  const parsed = Number(process.env.MAILBOX_AUTO_SYNC_INTERVAL_MINUTES || DEFAULT_AUTO_SYNC_INTERVAL_MINUTES);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : Number(DEFAULT_AUTO_SYNC_INTERVAL_MINUTES);
+})();
+const AUTO_SYNC_LIMIT = (() => {
+  const parsed = Number(process.env.MAILBOX_AUTO_SYNC_LIMIT || DEFAULT_AUTO_SYNC_LIMIT);
+  const safe = Number.isFinite(parsed) ? parsed : Number(DEFAULT_AUTO_SYNC_LIMIT);
+  return Math.max(1, Math.min(500, safe));
+})();
+const AUTO_SYNC_CONFIG_ID = (process.env.MAILBOX_AUTO_SYNC_CONFIG_ID || DEFAULT_AUTO_SYNC_CONFIG_ID || '').trim();
 
 const buildCheckOverrides = (body) => {
   const nested = body?.overrides && typeof body.overrides === 'object' ? body.overrides : {};
@@ -435,6 +714,60 @@ const sanitizeBounceEmails = (emails, senderEmail) => {
   }
 
   return [...unique];
+};
+
+const chunk = (items, size) => {
+  const chunks = [];
+  for (let index = 0; index < items.length; index += size) {
+    chunks.push(items.slice(index, index + size));
+  }
+  return chunks;
+};
+
+const buildCaseInsensitiveEmailOrFilter = (emails) =>
+  emails
+    .map((email) => {
+      const escaped = String(email)
+        .replace(/\\/g, '\\\\')
+        .replace(/,/g, '\\,')
+        .replace(/%/g, '\\%')
+        .replace(/_/g, '\\_');
+      return `email.ilike.${escaped}`;
+    })
+    .join(',');
+
+const fetchRecipientsByEmailCaseInsensitive = async (dbClient, emails, selectFields) => {
+  const normalizedEmails = [...new Set(
+    (emails || [])
+      .map((email) => String(email || '').trim().toLowerCase())
+      .filter(Boolean)
+  )];
+
+  if (normalizedEmails.length === 0) {
+    return [];
+  }
+
+  const recipientsById = new Map();
+  const emailChunks = chunk(normalizedEmails, 40);
+
+  for (const emailChunk of emailChunks) {
+    const orFilter = buildCaseInsensitiveEmailOrFilter(emailChunk);
+    const { data, error } = await dbClient
+      .from('recipients')
+      .select(selectFields)
+      .or(orFilter);
+
+    if (error) {
+      console.error('[mailbox] Failed case-insensitive recipient lookup:', error);
+      continue;
+    }
+
+    (data || []).forEach((recipient) => {
+      if (recipient?.id) recipientsById.set(recipient.id, recipient);
+    });
+  }
+
+  return Array.from(recipientsById.values());
 };
 
 const getImapHostCandidates = (config) => {
@@ -636,12 +969,13 @@ const processDbEmails = async (dbClient, config, lookbackDays) => {
     const uniqueBounceEmails = sanitizeBounceEmails(allFoundEmails, senderEmail);
 
     if (uniqueBounceEmails.length > 0) {
-      const { data: potentialBounces, error: bounceError } = await dbClient
-        .from('recipients')
-        .select('id, email, campaign_id, status, bounced')
-        .in('email', uniqueBounceEmails);
+      const potentialBounces = await fetchRecipientsByEmailCaseInsensitive(
+        dbClient,
+        uniqueBounceEmails,
+        'id, email, campaign_id, status, bounced'
+      );
 
-      if (!bounceError && potentialBounces && potentialBounces.length > 0) {
+      if (potentialBounces && potentialBounces.length > 0) {
         const newBounces = potentialBounces.filter((recipient) => !recipient.bounced);
         console.log(
           `[mailbox] [DB Mode] Found ${newBounces.length} new bounces out of ${potentialBounces.length} matches.`
@@ -693,13 +1027,13 @@ const processDbEmails = async (dbClient, config, lookbackDays) => {
   const uniqueSenders = [...new Set(senderEmails)];
 
   if (uniqueSenders.length > 0) {
-    const { data: potentialReplies, error: replyError } = await dbClient
-      .from('recipients')
-      .select('id, email, campaign_id, last_email_sent_at, created_at')
-      .in('email', uniqueSenders)
-      .eq('replied', false);
+    const potentialReplies = (await fetchRecipientsByEmailCaseInsensitive(
+      dbClient,
+      uniqueSenders,
+      'id, email, campaign_id, last_email_sent_at, updated_at, replied'
+    )).filter((recipient) => !recipient.replied);
 
-    if (!replyError && potentialReplies && potentialReplies.length > 0) {
+    if (potentialReplies && potentialReplies.length > 0) {
       console.log(`[mailbox] [DB Mode] Found ${potentialReplies.length} potential replies to process.`);
 
       const senderLastMsgDate = new Map();
@@ -718,7 +1052,7 @@ const processDbEmails = async (dbClient, config, lookbackDays) => {
 
       for (const recipient of potentialReplies) {
         const replyDate = senderLastMsgDate.get(recipient.email.toLowerCase());
-        const sentDateStr = recipient.last_email_sent_at || recipient.created_at;
+        const sentDateStr = recipient.last_email_sent_at || recipient.updated_at;
 
         if (replyDate && sentDateStr) {
           const sentDate = new Date(sentDateStr);
@@ -752,14 +1086,23 @@ const processDbEmails = async (dbClient, config, lookbackDays) => {
 
 const checkRepliesAndBouncesForConfig = async (dbClient, config, lookbackDays = 7, overrides) => {
   let lastError;
+  const activeConfig = await ensureMailboxTransportConfig(
+    config,
+    dbClient,
+    `reply check (${config?.smtp_username || config?.id || 'unknown'})`
+  );
 
-  const hostCandidates = resolveHostCandidates(config, overrides);
-  if (!hostCandidates.length) {
-    throw new Error(`IMAP host missing for ${config.smtp_username}`);
+  if (!hasMailboxTransportCredentials(activeConfig)) {
+    throw new Error(`Mailbox credentials missing for ${activeConfig.smtp_username || activeConfig.id}`);
   }
 
-  const security = normalizeSecurity(config.security);
-  const connectionProfiles = buildConnectionProfiles(config, security, overrides);
+  const hostCandidates = resolveHostCandidates(activeConfig, overrides);
+  if (!hostCandidates.length) {
+    throw new Error(`IMAP host missing for ${activeConfig.smtp_username}`);
+  }
+
+  const security = normalizeSecurity(activeConfig.security);
+  const connectionProfiles = buildConnectionProfiles(activeConfig, security, overrides);
   const enableTlsDebug = (process.env.IMAP_DEBUG_TLS || '').toLowerCase() === 'true';
   const maxAttempts = Number.isFinite(overrides?.max_attempts)
     ? Math.max(1, Math.min(3, Number(overrides.max_attempts)))
@@ -799,7 +1142,7 @@ const checkRepliesAndBouncesForConfig = async (dbClient, config, lookbackDays = 
     for (const profile of connectionProfiles) {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         console.log(
-          `[mailbox] Connecting to ${host}:${profile.port} (${profile.label}) for ${config.smtp_username} (Attempt ${attempt})...`
+          `[mailbox] Connecting to ${host}:${profile.port} (${profile.label}) for ${activeConfig.smtp_username} (Attempt ${attempt})...`
         );
 
         if (enableTlsDebug && profile.secure) {
@@ -815,18 +1158,14 @@ const checkRepliesAndBouncesForConfig = async (dbClient, config, lookbackDays = 
           tlsOptions.servername = host;
         }
 
-        const auth = {
-          user: config.smtp_username,
-          pass: config.smtp_password,
-        };
-
-        if (attempt === 1) {
-          auth.loginMethod = 'AUTH=PLAIN';
-        } else if (attempt === 2) {
-          auth.loginMethod = 'AUTH=LOGIN';
-        } else {
-          auth.loginMethod = 'LOGIN';
-        }
+        const loginMethod = isOAuthMailboxConfig(activeConfig)
+          ? undefined
+          : attempt === 1
+            ? 'AUTH=PLAIN'
+            : attempt === 2
+              ? 'AUTH=LOGIN'
+              : 'LOGIN';
+        const auth = buildImapAuthFromConfig(activeConfig, loginMethod);
 
         const client = new ImapFlow({
           host,
@@ -855,7 +1194,7 @@ const checkRepliesAndBouncesForConfig = async (dbClient, config, lookbackDays = 
 
         client.on('error', (err) => {
           console.error(
-            `[mailbox] IMAP Client Error for ${config.smtp_username} (${host}:${profile.port}) (Attempt ${attempt}):`,
+            `[mailbox] IMAP Client Error for ${activeConfig.smtp_username} (${host}:${profile.port}) (Attempt ${attempt}):`,
             err
           );
         });
@@ -994,21 +1333,24 @@ const checkRepliesAndBouncesForConfig = async (dbClient, config, lookbackDays = 
                       else if (Array.isArray(failedHeader)) foundEmails.push(...failedHeader);
                     }
 
-                    const senderEmail = (config.smtp_username || '').toLowerCase();
+                    const senderEmail = (activeConfig.smtp_username || '').toLowerCase();
                     const uniqueEmails = sanitizeBounceEmails(foundEmails, senderEmail);
 
                     if (uniqueEmails.length > 0) {
-                      const { data: recipients, error: recipientsError } = await dbClient
-                        .from('recipients')
-                        .select('id, email, campaign_id, bounced')
-                        .in('email', uniqueEmails)
-                        .or('bounced.is.null,bounced.eq.false')
-                        .order('last_email_sent_at', { ascending: false });
+                      const recipients = await fetchRecipientsByEmailCaseInsensitive(
+                        dbClient,
+                        uniqueEmails,
+                        'id, email, campaign_id, bounced, last_email_sent_at'
+                      );
 
-                      if (recipientsError) {
-                        console.error('[mailbox] Error fetching recipients for bounce processing:', recipientsError);
-                      } else if (recipients && recipients.length > 0) {
-                        const recipientsToUpdate = recipients.filter((recipient) => !recipient.bounced);
+                      if (recipients && recipients.length > 0) {
+                        const recipientsToUpdate = recipients
+                          .filter((recipient) => !recipient.bounced)
+                          .sort((a, b) => {
+                            const timeA = a.last_email_sent_at ? new Date(a.last_email_sent_at).getTime() : 0;
+                            const timeB = b.last_email_sent_at ? new Date(b.last_email_sent_at).getTime() : 0;
+                            return timeB - timeA;
+                          });
                         const recipientIds = recipientsToUpdate.map((recipient) => recipient.id);
                         const campaignIds = new Set(recipientsToUpdate.map((recipient) => recipient.campaign_id));
 
@@ -1054,18 +1396,18 @@ const checkRepliesAndBouncesForConfig = async (dbClient, config, lookbackDays = 
             try {
               lock?.release();
             } catch (releaseError) {
-              console.warn(`[mailbox] Mailbox lock release failed for ${config.smtp_username}:`, releaseError);
+              console.warn(`[mailbox] Mailbox lock release failed for ${activeConfig.smtp_username}:`, releaseError);
             }
           }
         } catch (err) {
           lastError = err;
           console.error(
-            `[mailbox] Error checking emails for ${config.smtp_username} (${host}:${profile.port}) (Attempt ${attempt}):`,
+            `[mailbox] Error checking emails for ${activeConfig.smtp_username} (${host}:${profile.port}) (Attempt ${attempt}):`,
             err
           );
 
           if (attempt < maxAttempts) {
-            console.log(`[mailbox] Retrying ${config.smtp_username} in 2s...`);
+            console.log(`[mailbox] Retrying ${activeConfig.smtp_username} in 2s...`);
             await new Promise((resolve) => setTimeout(resolve, 2000));
           }
         } finally {
@@ -1161,13 +1503,27 @@ const loadMessageForUser = async (dbClient, user, messageId, canBypassAuth) => {
 };
 
 const loadConfigForUser = async (dbClient, user, configId, canBypassAuth) => {
-  let query = dbClient.from('email_configs').select('*').eq('id', configId);
-  if (!canBypassAuth) {
-    query = query.eq('user_id', user.id);
+  const normalizedConfigId = String(configId || '').trim();
+  if (!normalizedConfigId) return null;
+
+  const runQuery = async (client) => {
+    let query = client.from('email_configs').select('*').eq('id', normalizedConfigId);
+    if (!canBypassAuth) {
+      query = query.eq('user_id', user.id);
+    }
+    return query.maybeSingle();
+  };
+
+  const primary = await runQuery(dbClient);
+  if (!primary.error) return primary.data;
+
+  if (supabaseAdmin && dbClient !== supabaseAdmin) {
+    const fallback = await runQuery(supabaseAdmin);
+    if (!fallback.error) return fallback.data;
+    throw fallback.error;
   }
-  const { data, error } = await query.maybeSingle();
-  if (error) throw error;
-  return data;
+
+  throw primary.error;
 };
 
 const runReplyCheck = async ({ configId, lookbackDays, useDbScan, overrides, source = 'manual' } = {}) => {
@@ -1227,6 +1583,79 @@ const runReplyCheck = async ({ configId, lookbackDays, useDbScan, overrides, sou
 
 let autoCheckInFlight = false;
 let autoCheckTimer = null;
+let autoSyncInFlight = false;
+let autoSyncTimer = null;
+
+const runMailboxSync = async ({ configId, limit, source = 'manual' } = {}) => {
+  if (!supabaseAdmin) {
+    throw new Error('Supabase service role key is required for mailbox sync.');
+  }
+
+  const safeConfigId = configId ? String(configId).trim() : '';
+  const parsedLimit = Number(limit ?? 50);
+  const safeLimit = Math.max(1, Math.min(500, Number.isFinite(parsedLimit) ? parsedLimit : 50));
+
+  let query = supabaseAdmin
+    .from('email_configs')
+    .select('*')
+    .not('imap_host', 'is', null)
+    .not('imap_port', 'is', null)
+    .not('smtp_username', 'is', null);
+
+  if (safeConfigId) {
+    query = query.eq('id', safeConfigId);
+  }
+
+  const { data: configs, error } = await query;
+  if (error) {
+    console.error('[mailbox] Failed to load email configs for mailbox sync:', error);
+    throw new Error('Failed to load email configurations.');
+  }
+
+  const results = [];
+  const safeConfigs = configs ?? [];
+  let totalProcessed = 0;
+  let totalInserted = 0;
+  let totalSkipped = 0;
+  let failed = 0;
+
+  for (const config of safeConfigs) {
+    try {
+      const stats = await syncMailbox(config, safeLimit, supabaseAdmin);
+      totalProcessed += Number(stats?.processed || 0);
+      totalInserted += Number(stats?.inserted || 0);
+      totalSkipped += Number(stats?.skipped || 0);
+      results.push({
+        config_id: config.id,
+        email: config.smtp_username,
+        ...stats,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+    } catch (err) {
+      failed++;
+      console.error(`[mailbox] Error syncing ${config.smtp_username}:`, err);
+      results.push({
+        config_id: config.id,
+        email: config.smtp_username,
+        error: err?.message || 'Mailbox sync failed',
+      });
+    }
+  }
+
+  return {
+    success: true,
+    results,
+    limit: safeLimit,
+    configCount: safeConfigs.length,
+    totals: {
+      processed: totalProcessed,
+      inserted: totalInserted,
+      skipped: totalSkipped,
+      failed,
+    },
+    source,
+  };
+};
 
 const startAutoReplyChecks = () => {
   if (!AUTO_CHECK_REPLIES) return;
@@ -1278,8 +1707,313 @@ const startAutoReplyChecks = () => {
   }
 };
 
+const startAutoMailboxSync = () => {
+  if (!AUTO_SYNC_MAILBOXES) return;
+  if (!supabaseAdmin) {
+    console.warn('[mailbox] Auto mailbox sync disabled: SUPABASE_SERVICE_ROLE_KEY is required.');
+    return;
+  }
+
+  const intervalMs = Math.max(1, AUTO_SYNC_INTERVAL_MINUTES) * 60 * 1000;
+
+  const run = async () => {
+    if (autoSyncInFlight) {
+      console.log('[mailbox] Auto mailbox sync skipped (previous run still in progress).');
+      return;
+    }
+    autoSyncInFlight = true;
+    const startedAt = Date.now();
+    try {
+      const payload = await runMailboxSync({
+        configId: AUTO_SYNC_CONFIG_ID || undefined,
+        limit: AUTO_SYNC_LIMIT,
+        source: 'auto',
+      });
+      const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
+      console.log(
+        `[mailbox] Auto mailbox sync complete in ${durationSeconds}s (${payload.configCount} mailbox${
+          payload.configCount === 1 ? '' : 'es'
+        }, ${payload.totals?.inserted || 0} inserted, ${payload.totals?.failed || 0} failed).`
+      );
+    } catch (error) {
+      console.error('[mailbox] Auto mailbox sync failed:', error?.message || error);
+    } finally {
+      autoSyncInFlight = false;
+    }
+  };
+
+  console.log(
+    `[mailbox] Auto mailbox sync enabled. Interval: ${AUTO_SYNC_INTERVAL_MINUTES} min, limit: ${AUTO_SYNC_LIMIT}${
+      AUTO_SYNC_CONFIG_ID ? `, configId: ${AUTO_SYNC_CONFIG_ID}` : ''
+    }.`
+  );
+  run();
+  autoSyncTimer = setInterval(run, intervalMs);
+  if (typeof autoSyncTimer?.unref === 'function') {
+    autoSyncTimer.unref();
+  }
+};
+
+const decodeJwtPayload = (token) => {
+  if (!token || typeof token !== 'string') return {};
+  const parts = token.split('.');
+  if (parts.length < 2) return {};
+
+  try {
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), '=');
+    const raw = Buffer.from(padded, 'base64').toString('utf8');
+    return JSON.parse(raw);
+  } catch {
+    return {};
+  }
+};
+
+const fetchGoogleMailboxIdentity = async (accessToken) => {
+  try {
+    const response = await axios.get('https://www.googleapis.com/oauth2/v3/userinfo', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    return {
+      email: String(response?.data?.email || '').trim(),
+      displayName: String(response?.data?.name || '').trim(),
+    };
+  } catch (error) {
+    console.warn('[mailbox] Google userinfo lookup failed:', error?.response?.data || error?.message || error);
+    return { email: '', displayName: '' };
+  }
+};
+
+const fetchMicrosoftMailboxIdentity = async (accessToken) => {
+  try {
+    const response = await axios.get('https://graph.microsoft.com/v1.0/me?$select=displayName,mail,userPrincipalName', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    return {
+      email: String(response?.data?.mail || response?.data?.userPrincipalName || '').trim(),
+      displayName: String(response?.data?.displayName || '').trim(),
+    };
+  } catch (error) {
+    console.warn('[mailbox] Microsoft Graph user lookup failed:', error?.response?.data || error?.message || error);
+    return { email: '', displayName: '' };
+  }
+};
+
+const buildMailboxOAuthAuthorizationUrl = ({ provider, state, redirectUri }) => {
+  if (provider === 'gmail') {
+    if (!GOOGLE_OAUTH_CLIENT_ID) {
+      throw new Error('GOOGLE_OAUTH_CLIENT_ID is not configured.');
+    }
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: GOOGLE_OAUTH_CLIENT_ID,
+      redirect_uri: redirectUri,
+      scope: GOOGLE_OAUTH_SCOPES,
+      access_type: 'offline',
+      include_granted_scopes: 'true',
+      prompt: 'consent',
+      state,
+    });
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+  }
+
+  if (provider === 'outlook') {
+    if (!MICROSOFT_OAUTH_CLIENT_ID) {
+      throw new Error('MICROSOFT_OAUTH_CLIENT_ID is not configured.');
+    }
+    const params = new URLSearchParams({
+      response_type: 'code',
+      client_id: MICROSOFT_OAUTH_CLIENT_ID,
+      redirect_uri: redirectUri,
+      response_mode: 'query',
+      scope: MICROSOFT_OAUTH_SCOPES,
+      prompt: 'select_account',
+      state,
+    });
+    return `https://login.microsoftonline.com/${encodeURIComponent(MICROSOFT_OAUTH_TENANT_ID)}/oauth2/v2.0/authorize?${params.toString()}`;
+  }
+
+  throw new Error('Unsupported mailbox OAuth provider.');
+};
+
+const exchangeMailboxOAuthCode = async ({ provider, code, redirectUri }) => {
+  let tokenResp;
+  if (provider === 'gmail') {
+    if (!GOOGLE_OAUTH_CLIENT_ID || !GOOGLE_OAUTH_CLIENT_SECRET) {
+      throw new Error('Google OAuth credentials are not configured.');
+    }
+
+    const payload = new URLSearchParams({
+      code,
+      client_id: GOOGLE_OAUTH_CLIENT_ID,
+      client_secret: GOOGLE_OAUTH_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+    });
+    tokenResp = await axios.post('https://oauth2.googleapis.com/token', payload.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    });
+  } else if (provider === 'outlook') {
+    if (!MICROSOFT_OAUTH_CLIENT_ID || !MICROSOFT_OAUTH_CLIENT_SECRET) {
+      throw new Error('Microsoft OAuth credentials are not configured.');
+    }
+    const payload = new URLSearchParams({
+      code,
+      client_id: MICROSOFT_OAUTH_CLIENT_ID,
+      client_secret: MICROSOFT_OAUTH_CLIENT_SECRET,
+      redirect_uri: redirectUri,
+      grant_type: 'authorization_code',
+      scope: MICROSOFT_OAUTH_SCOPES,
+    });
+    tokenResp = await axios.post(
+      `https://login.microsoftonline.com/${encodeURIComponent(MICROSOFT_OAUTH_TENANT_ID)}/oauth2/v2.0/token`,
+      payload.toString(),
+      {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }
+    );
+  } else {
+    throw new Error('Unsupported mailbox OAuth provider.');
+  }
+
+  const payload = tokenResp?.data || {};
+  const accessToken = String(payload.access_token || '').trim();
+  const refreshToken = String(payload.refresh_token || '').trim();
+  const tokenType = String(payload.token_type || 'Bearer').trim();
+  const scope = String(payload.scope || '').trim();
+  const expiresIn = Number(payload.expires_in);
+  const expiresAt = Number.isFinite(expiresIn) && expiresIn > 0
+    ? new Date(Date.now() + expiresIn * 1000).toISOString()
+    : null;
+
+  if (!accessToken) {
+    throw new Error('OAuth exchange did not return an access token.');
+  }
+
+  const jwtPayload = decodeJwtPayload(payload.id_token || '');
+  const profile = provider === 'gmail'
+    ? await fetchGoogleMailboxIdentity(accessToken)
+    : await fetchMicrosoftMailboxIdentity(accessToken);
+
+  const email =
+    String(profile.email || jwtPayload.email || jwtPayload.preferred_username || jwtPayload.upn || '').trim();
+  const displayName =
+    String(profile.displayName || jwtPayload.name || jwtPayload.given_name || '').trim();
+
+  if (!email) {
+    throw new Error('OAuth exchange succeeded but mailbox email could not be resolved.');
+  }
+
+  const preset = resolveMailboxPresetForProvider(provider);
+  return {
+    provider,
+    accessToken,
+    refreshToken: refreshToken || null,
+    tokenType,
+    scope: scope || null,
+    expiresIn: Number.isFinite(expiresIn) ? expiresIn : null,
+    expiresAt,
+    email,
+    displayName: displayName || email,
+    ...(preset || {}),
+  };
+};
+
 app.get('/healthz', (_req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
+app.post('/mailbox/:provider/oauth/start', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const user = await authenticateRequest(authHeader);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const provider = resolveMailboxOAuthProvider(req.params.provider);
+    if (!provider) {
+      return res.status(400).json({ error: 'Unsupported mailbox OAuth provider.' });
+    }
+
+    const redirectUri = resolveMailboxOAuthRedirectUri(req.body?.redirectUri);
+    const state = `${provider}:${crypto.randomUUID()}`;
+
+    if (MAILBOX_OAUTH_SIMULATE) {
+      const simulatedCode = `sim-${provider}-${Date.now()}`;
+      const simulatedUrl = new URL(redirectUri);
+      simulatedUrl.searchParams.set('code', simulatedCode);
+      simulatedUrl.searchParams.set('state', state);
+      return res.json({
+        mode: 'simulate',
+        provider,
+        state,
+        authUrl: simulatedUrl.toString(),
+        simulatedCode,
+      });
+    }
+
+    const authUrl = buildMailboxOAuthAuthorizationUrl({ provider, state, redirectUri });
+    return res.json({
+      mode: 'live',
+      provider,
+      state,
+      authUrl,
+    });
+  } catch (error) {
+    console.error('[mailbox] OAuth start failed:', error?.response?.data || error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Unable to start mailbox OAuth flow.' });
+  }
+});
+
+app.post('/mailbox/:provider/oauth/exchange', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const user = await authenticateRequest(authHeader);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const provider = resolveMailboxOAuthProvider(req.params.provider);
+    if (!provider) {
+      return res.status(400).json({ error: 'Unsupported mailbox OAuth provider.' });
+    }
+
+    const code = String(req.body?.code || '').trim();
+    if (!code) {
+      return res.status(400).json({ error: 'OAuth code is required.' });
+    }
+
+    const redirectUri = resolveMailboxOAuthRedirectUri(req.body?.redirectUri);
+
+    if (MAILBOX_OAUTH_SIMULATE || code.startsWith('sim-')) {
+      const preset = resolveMailboxPresetForProvider(provider);
+      const simulatedEmail = `sim.${provider}.${user.id.slice(0, 8)}@example.com`;
+      return res.json({
+        provider,
+        accessToken: `sim-access-${provider}-${Date.now()}`,
+        refreshToken: `sim-refresh-${provider}-${Date.now()}`,
+        tokenType: 'Bearer',
+        scope: provider === 'gmail' ? GOOGLE_OAUTH_SCOPES : MICROSOFT_OAUTH_SCOPES,
+        expiresIn: 3600,
+        expiresAt: new Date(Date.now() + 3600 * 1000).toISOString(),
+        email: simulatedEmail,
+        displayName: `Simulated ${provider === 'gmail' ? 'Gmail' : 'Outlook'} mailbox`,
+        ...(preset || {}),
+      });
+    }
+
+    const payload = await exchangeMailboxOAuthCode({
+      provider,
+      code,
+      redirectUri,
+    });
+
+    return res.json(payload);
+  } catch (error) {
+    console.error('[mailbox] OAuth exchange failed:', error?.response?.data || error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Unable to complete mailbox OAuth exchange.' });
+  }
 });
 
 app.post('/crm/:provider/oauth/start', (req, res) => {
@@ -1586,7 +2320,13 @@ app.post('/api/inbox/messages/:id/reply', async (req, res) => {
       return res.status(404).json({ error: 'Email configuration not found' });
     }
 
-    if (!config.smtp_host || !config.smtp_username || !config.smtp_password) {
+    const activeConfig = await ensureMailboxTransportConfig(
+      config,
+      dbClient,
+      `inbox reply (${config?.smtp_username || config?.id || 'unknown'})`
+    );
+
+    if (!hasMailboxTransportCredentials(activeConfig)) {
       return res.status(400).json({ error: 'SMTP credentials are missing for this inbox.' });
     }
 
@@ -1597,21 +2337,61 @@ app.post('/api/inbox/messages/:id/reply', async (req, res) => {
       return res.status(400).json({ error: 'Reply body is required.' });
     }
 
-    const result = await emailService.sendReply({
-      config,
-      original: message,
-      payload: {
-        ...payload,
-        mode,
-      },
-    });
+    const creditReferenceId = `inbox-reply:${message.id}:${Date.now()}`;
+    const creditResult = await consumeUserCredits(
+      dbClient,
+      user.id,
+      OUTBOUND_EMAIL_CREDIT_COST,
+      'inbox_reply_send',
+      creditReferenceId,
+      {
+        source: 'inbox_reply',
+        message_id: message.id,
+        config_id: message.config_id,
+      }
+    );
+
+    if (!creditResult.allowed) {
+      return res.status(402).json({
+        error: creditResult.message || 'Insufficient credits',
+        creditsRemaining: creditResult.creditsRemaining,
+      });
+    }
+
+    let result;
+    try {
+      result = await emailService.sendReply({
+        config: activeConfig,
+        original: message,
+        payload: {
+          ...payload,
+          mode,
+        },
+      });
+    } catch (sendError) {
+      await refundUserCredits(
+        dbClient,
+        user.id,
+        OUTBOUND_EMAIL_CREDIT_COST,
+        'inbox_reply_refund',
+        creditReferenceId,
+        {
+          source: 'inbox_reply',
+          message_id: message.id,
+          config_id: message.config_id,
+          reason: 'send_failure',
+          error: sendError?.message || String(sendError),
+        }
+      );
+      throw sendError;
+    }
 
     const sentAt = new Date().toISOString();
     const sentRow = {
       user_id: message.user_id,
       config_id: message.config_id,
       uid: null,
-      from_email: config.smtp_username,
+      from_email: activeConfig.smtp_username,
       to_email: result.to?.[0] || '',
       to_emails: result.to,
       cc_emails: result.cc,
@@ -1646,6 +2426,135 @@ app.post('/api/inbox/messages/:id/reply', async (req, res) => {
   }
 });
 
+app.post('/api/inbox/compose', async (req, res) => {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const canBypassAuth = MAILBOX_BYPASS_AUTH && hasServiceRoleKey;
+    const user = await authenticateRequest(authHeader);
+    if (!user) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    const dbClient = supabaseAdmin || buildUserSupabaseClient(authHeader);
+    if (!dbClient) {
+      return res.status(500).json({ error: 'Supabase keys are not configured.' });
+    }
+
+    const payload = req.body || {};
+    const configId = payload.configId || payload.config_id;
+    if (!configId) {
+      return res.status(400).json({ error: 'configId is required.' });
+    }
+
+    const config = await loadConfigForUser(dbClient, user, configId, canBypassAuth);
+    if (!config) {
+      return res.status(404).json({ error: 'Email configuration not found' });
+    }
+
+    const activeConfig = await ensureMailboxTransportConfig(
+      config,
+      dbClient,
+      `inbox compose (${config?.smtp_username || config?.id || 'unknown'})`
+    );
+
+    if (!hasMailboxTransportCredentials(activeConfig)) {
+      return res.status(400).json({ error: 'SMTP credentials are missing for this inbox.' });
+    }
+
+    if (!payload.text && !payload.html) {
+      return res.status(400).json({ error: 'Message body is required.' });
+    }
+
+    const creditReferenceId = `inbox-compose:${config.id}:${Date.now()}`;
+    const creditResult = await consumeUserCredits(
+      dbClient,
+      user.id,
+      OUTBOUND_EMAIL_CREDIT_COST,
+      'inbox_compose_send',
+      creditReferenceId,
+      {
+        source: 'inbox_compose',
+        config_id: config.id,
+        subject: payload.subject || null,
+      }
+    );
+
+    if (!creditResult.allowed) {
+      return res.status(402).json({
+        error: creditResult.message || 'Insufficient credits',
+        creditsRemaining: creditResult.creditsRemaining,
+      });
+    }
+
+    let result;
+    try {
+      result = await emailService.sendCompose({
+        config: activeConfig,
+        payload: {
+          subject: payload.subject,
+          text: payload.text,
+          html: payload.html,
+          to: payload.to,
+          cc: payload.cc,
+          bcc: payload.bcc,
+          attachments: payload.attachments,
+        },
+      });
+    } catch (sendError) {
+      await refundUserCredits(
+        dbClient,
+        user.id,
+        OUTBOUND_EMAIL_CREDIT_COST,
+        'inbox_compose_refund',
+        creditReferenceId,
+        {
+          source: 'inbox_compose',
+          config_id: config.id,
+          reason: 'send_failure',
+          error: sendError?.message || String(sendError),
+        }
+      );
+      throw sendError;
+    }
+
+    const sentAt = new Date().toISOString();
+    const sentRow = {
+      user_id: config.user_id || user.id,
+      config_id: config.id,
+      uid: null,
+      from_email: activeConfig.smtp_username,
+      to_email: result.to?.[0] || '',
+      to_emails: result.to,
+      cc_emails: result.cc,
+      subject: result.subject,
+      body: result.html || result.text || '',
+      date: sentAt,
+      folder: 'Sent',
+      read: true,
+      message_id: result.messageId,
+      in_reply_to: null,
+      references: null,
+      attachments: result.attachmentsMeta || [],
+      thread_id: result.threadId,
+      direction: 'outbound',
+    };
+
+    const { error: insertError } = await dbClient.from('email_messages').insert(sentRow);
+    if (insertError) {
+      console.error('[mailbox] Failed to store sent compose message:', insertError?.message || insertError);
+    }
+
+    return res.json({
+      success: true,
+      messageId: result.messageId,
+      threadId: result.threadId,
+    });
+  } catch (error) {
+    console.error('[mailbox] Compose send failed:', error?.message || error);
+    return res.status(500).json({ error: error?.message || 'Failed to send message' });
+  }
+});
+
 app.post('/sync-mailbox', async (req, res) => {
   try {
     const authHeader = req.headers.authorization || '';
@@ -1662,25 +2571,22 @@ app.post('/sync-mailbox', async (req, res) => {
       });
     }
 
-    const { configId, limit = 50 } = req.body || {};
+    const body = req.body || {};
+    const configId = body.configId || body.config_id || body.mailboxId || null;
+    const limit = body.limit ?? 50;
     if (!configId) {
       return res.status(400).json({ error: 'configId is required' });
     }
 
-    let configQuery = dbClient
-      .from('email_configs')
-      .select('*')
-      .eq('id', configId);
-
-    if (!canBypassAuth) {
-      configQuery = configQuery.eq('user_id', user.id);
-    }
-
-    const { data: config, error: configError } = await configQuery.maybeSingle();
-
-    if (configError) {
+    let config = null;
+    try {
+      config = await loadConfigForUser(dbClient, user, configId, canBypassAuth);
+    } catch (configError) {
       console.error('[mailbox] Failed to load email configuration:', configError);
-      return res.status(500).json({ error: 'Failed to load email configuration' });
+      return res.status(500).json({
+        error: 'Failed to load email configuration',
+        details: configError?.message || String(configError),
+      });
     }
 
     if (!config) {
@@ -1727,5 +2633,6 @@ app.post('/check-email-replies', async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Mailbox sync server listening on port ${PORT}`);
   console.log('Allowed origins:', ALLOWED_ORIGINS.join(', ') || '*');
+  startAutoMailboxSync();
   startAutoReplyChecks();
 });
